@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <type_traits>
@@ -19,6 +20,10 @@
 #include "reader.h"
 #include "timer.h"
 #include "util.h"
+
+#ifdef GAPBS_CXL_SHM
+#include "cxl_graph_layout.h"
+#endif
 
 
 /*
@@ -57,6 +62,107 @@ class BuilderBase {
       exit(-30);
     }
   }
+
+#ifdef GAPBS_CXL_SHM
+  CSRGraph<NodeID_, DestID_, invert> CopyToCxlShm(
+      const CSRGraph<NodeID_, DestID_, invert> &g) {
+    using gapbs::cxl_graph::Header;
+    using gapbs::cxl_graph::kFlagDirected;
+    using gapbs::cxl_graph::kFlagHasInverse;
+    using gapbs::cxl_graph::kFlagWeighted;
+    using gapbs::cxl_graph::kMagic;
+    using gapbs::cxl_graph::kVersion;
+
+    gapbs::cxl_graph::ResetRegion();
+    gapbs::cxl_shm::Mapping &shm = gapbs::cxl_shm::Global();
+
+    const int64_t n = g.num_nodes();
+    const bool directed = g.directed();
+    const bool weighted = !std::is_same<NodeID_, DestID_>::value;
+    const bool has_inverse = directed && (g.in_index() != nullptr) &&
+                             (g.in_neighbors() != nullptr);
+
+    pvector<SGOffset> out_offsets = g.VertexOffsets(false);
+    const size_t out_entries = static_cast<size_t>(out_offsets[n]);
+
+    SGOffset *out_offsets_shm = shm.AllocArray<SGOffset>(n + 1, 64);
+    std::memcpy(out_offsets_shm, out_offsets.data(),
+                static_cast<size_t>(n + 1) * sizeof(SGOffset));
+
+    DestID_ *out_neigh_shm = shm.AllocArray<DestID_>(out_entries, 64);
+    std::memcpy(out_neigh_shm, g.out_neighbors(),
+                out_entries * sizeof(DestID_));
+
+    DestID_ **out_index =
+        CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh_shm);
+
+    DestID_ **in_index = nullptr;
+    DestID_ *in_neigh_shm = nullptr;
+    SGOffset *in_offsets_shm = nullptr;
+    pvector<SGOffset> in_offsets;
+    size_t in_entries = 0;
+    if (has_inverse) {
+      in_offsets = g.VertexOffsets(true);
+      in_entries = static_cast<size_t>(in_offsets[n]);
+      in_offsets_shm = shm.AllocArray<SGOffset>(n + 1, 64);
+      std::memcpy(in_offsets_shm, in_offsets.data(),
+                  static_cast<size_t>(n + 1) * sizeof(SGOffset));
+      in_neigh_shm = shm.AllocArray<DestID_>(in_entries, 64);
+      std::memcpy(in_neigh_shm, g.in_neighbors(), in_entries * sizeof(DestID_));
+      in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets,
+                                                             in_neigh_shm);
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(shm.base());
+    Header h;
+    std::memset(&h, 0, sizeof(h));
+    h.magic = kMagic;
+    h.version = kVersion;
+    h.flags = 0;
+    if (directed)
+      h.flags |= kFlagDirected;
+    if (has_inverse)
+      h.flags |= kFlagHasInverse;
+    if (weighted)
+      h.flags |= kFlagWeighted;
+    h.num_nodes = static_cast<uint64_t>(n);
+    h.num_edges_directed = static_cast<uint64_t>(out_entries);
+    h.dest_bytes = static_cast<uint32_t>(sizeof(DestID_));
+
+    h.out_offsets_off =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_offsets_shm) -
+                              base);
+    h.out_neigh_off =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_neigh_shm) - base);
+    if (has_inverse) {
+      h.in_offsets_off =
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_offsets_shm) -
+                                base);
+      h.in_neigh_off =
+          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_neigh_shm) -
+                                base);
+    }
+    h.total_bytes = static_cast<uint64_t>(shm.used());
+    h.ready = 0;
+    gapbs::cxl_graph::Publish(h);
+    std::cerr << "[gapbs] CXL graph published: nodes=" << n
+              << " out_entries=" << out_entries
+              << " directed=" << (directed ? 1 : 0)
+              << " inverse=" << (has_inverse ? 1 : 0)
+              << " total_bytes=" << h.total_bytes << std::endl;
+
+    if (!directed) {
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm);
+    }
+    if (has_inverse) {
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm,
+                                                in_index, in_neigh_shm);
+    }
+    // Directed graph without inverse edges.
+    return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm,
+                                              nullptr, nullptr);
+  }
+#endif
 
   DestID_ GetSource(EdgePair<NodeID_, NodeID_> e) {
     return e.u;
@@ -342,12 +448,14 @@ class BuilderBase {
 
   CSRGraph<NodeID_, DestID_, invert> MakeGraph() {
     CSRGraph<NodeID_, DestID_, invert> g;
+    bool serialized = false;
     {  // extra scope to trigger earlier deletion of el (save memory)
       EdgeList el;
       if (cli_.filename() != "") {
         Reader<NodeID_, DestID_, WeightT_, invert> r(cli_.filename());
         if ((r.GetSuffix() == ".sg") || (r.GetSuffix() == ".wsg")) {
-          return r.ReadSerializedGraph();
+          g = r.ReadSerializedGraph();
+          serialized = true;
         } else {
           el = r.ReadFile(needs_weights_);
         }
@@ -355,12 +463,16 @@ class BuilderBase {
         Generator<NodeID_, DestID_> gen(cli_.scale(), cli_.degree());
         el = gen.GenerateEL(cli_.uniform());
       }
-      g = MakeGraphFromEL(el);
+      if (!serialized)
+        g = MakeGraphFromEL(el);
     }
-    if (in_place_)
-      return g;
-    else
-      return SquishGraph(g);
+    if (!in_place_ && !serialized)
+      g = SquishGraph(g);
+#ifdef GAPBS_CXL_SHM
+    return CopyToCxlShm(g);
+#else
+    return g;
+#endif
   }
 
   // Relabels (and rebuilds) graph by order of decreasing degree

@@ -13,6 +13,10 @@
 #include "pvector.h"
 #include "util.h"
 
+#ifdef GAPBS_CXL_SHM
+#include "cxl_shm.h"
+#endif
+
 
 /*
 GAP Benchmark Suite
@@ -119,13 +123,23 @@ class CSRGraph {
   void ReleaseResources() {
     if (out_index_ != nullptr)
       delete[] out_index_;
+#ifdef GAPBS_CXL_SHM
+    if (out_neighbors_ != nullptr && !gapbs::cxl_shm::PtrInCxlShm(out_neighbors_))
+      delete[] out_neighbors_;
+#else
     if (out_neighbors_ != nullptr)
       delete[] out_neighbors_;
+#endif
     if (directed_) {
       if (in_index_ != nullptr)
         delete[] in_index_;
+#ifdef GAPBS_CXL_SHM
+      if (in_neighbors_ != nullptr && !gapbs::cxl_shm::PtrInCxlShm(in_neighbors_))
+        delete[] in_neighbors_;
+#else
       if (in_neighbors_ != nullptr)
         delete[] in_neighbors_;
+#endif
     }
   }
 
@@ -238,6 +252,11 @@ class CSRGraph {
       std::cout << std::endl;
     }
   }
+
+  const DestID_* out_neighbors() const { return out_neighbors_; }
+  const DestID_* in_neighbors() const { return in_neighbors_; }
+  DestID_** out_index() const { return out_index_; }
+  DestID_** in_index() const { return in_index_; }
 
   static DestID_** GenIndex(const pvector<SGOffset> &offsets, DestID_* neighs) {
     NodeID_ length = offsets.size();

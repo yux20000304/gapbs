@@ -7,6 +7,14 @@ pr
 pr_spmv
 sssp
 tc
+bc-ring
+bfs-ring
+cc-ring
+cc_sv-ring
+pr-ring
+pr_spmv-ring
+sssp-ring
+tc-ring
 
 test/out/*.out
 
