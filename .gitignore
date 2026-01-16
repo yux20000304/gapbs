@@ -15,6 +15,14 @@ pr-ring
 pr_spmv-ring
 sssp-ring
 tc-ring
+bc-ring-secure
+bfs-ring-secure
+cc-ring-secure
+cc_sv-ring-secure
+pr-ring-secure
+pr_spmv-ring-secure
+sssp-ring-secure
+tc-ring-secure
 
 test/out/*.out
 

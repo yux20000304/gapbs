@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -22,7 +23,10 @@
 #include "util.h"
 
 #ifdef GAPBS_CXL_SHM
+#include <unistd.h>
+
 #include "cxl_graph_layout.h"
+#include "cxl_sec.h"
 #endif
 
 
@@ -64,53 +68,275 @@ class BuilderBase {
   }
 
 #ifdef GAPBS_CXL_SHM
-  CSRGraph<NodeID_, DestID_, invert> CopyToCxlShm(
-      const CSRGraph<NodeID_, DestID_, invert> &g) {
+  enum class CxlMode {
+    kPublish,
+    kAttach,
+    kAuto,
+  };
+
+  static bool EnvEnabledLocal(const char* key) {
+    const char* v = std::getenv(key);
+    return v && *v && *v != '0';
+  }
+
+  static unsigned EnvU32Local(const char* key, unsigned def) {
+    const char* v = std::getenv(key);
+    if (!v || !*v) return def;
+    return static_cast<unsigned>(std::strtoul(v, nullptr, 0));
+  }
+
+  static CxlMode GetCxlMode() {
+    const char* v = std::getenv("GAPBS_CXL_MODE");
+    if (!v || !*v) return CxlMode::kPublish;
+    if (std::strcmp(v, "publish") == 0) return CxlMode::kPublish;
+    if (std::strcmp(v, "attach") == 0) return CxlMode::kAttach;
+    if (std::strcmp(v, "auto") == 0) return CxlMode::kAuto;
+    std::cerr << "[gapbs] Unknown GAPBS_CXL_MODE='" << v
+              << "', expected publish|attach|auto (defaulting to publish)" << std::endl;
+    return CxlMode::kPublish;
+  }
+
+  static bool WaitGraphReady(unsigned timeout_ms) {
+    unsigned waited = 0;
+    while (waited < timeout_ms) {
+      if (gapbs::cxl_graph::Ready()) return true;
+      usleep(10 * 1000);
+      waited += 10;
+    }
+    return false;
+  }
+
+  CSRGraph<NodeID_, DestID_, invert> LoadFromCxlShm() {
     using gapbs::cxl_graph::Header;
     using gapbs::cxl_graph::kFlagDirected;
+    using gapbs::cxl_graph::kFlagEncrypted;
+    using gapbs::cxl_graph::kFlagHasPublic;
+    using gapbs::cxl_graph::kFlagHasInverse;
+    using gapbs::cxl_graph::kVersion;
+
+    gapbs::cxl_shm::Mapping& shm = gapbs::cxl_shm::Global();
+    shm.InitFromEnv();
+
+    unsigned timeout_ms = EnvU32Local("GAPBS_CXL_ATTACH_TIMEOUT_MS", 30000);
+    if (!WaitGraphReady(timeout_ms)) {
+      std::cerr << "[gapbs] CXL graph not ready after " << timeout_ms << " ms"
+                << std::endl;
+      std::exit(-131);
+    }
+
+    const Header* hdr = gapbs::cxl_graph::GetHeader();
+    Header h = *hdr;
+    __sync_synchronize();
+    if (h.version != kVersion) {
+      std::cerr << "[gapbs] Unsupported CXL graph header version: " << h.version << std::endl;
+      std::exit(-132);
+    }
+    if (h.dest_bytes != sizeof(DestID_)) {
+      std::cerr << "[gapbs] CXL graph type mismatch: header.dest_bytes=" << h.dest_bytes
+                << " but sizeof(DestID_)=" << sizeof(DestID_) << std::endl;
+      std::exit(-133);
+    }
+
+    const bool directed = (h.flags & kFlagDirected) != 0;
+    const bool has_inverse = (h.flags & kFlagHasInverse) != 0;
+    const bool encrypted = (h.flags & kFlagEncrypted) != 0;
+    const int64_t n = static_cast<int64_t>(h.num_nodes);
+    if (n < 0) {
+      std::cerr << "[gapbs] Invalid CXL graph header num_nodes=" << h.num_nodes << std::endl;
+      std::exit(-134);
+    }
+
+    const size_t nn = static_cast<size_t>(n);
+    const size_t out_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+    const size_t out_entries = static_cast<size_t>(h.num_edges_directed);
+    const size_t out_neigh_bytes = out_entries * static_cast<size_t>(h.dest_bytes);
+
+    const unsigned char* mm = reinterpret_cast<const unsigned char*>(shm.base());
+
+    if (!encrypted) {
+      pvector<SGOffset> out_offsets(nn + 1);
+      std::memcpy(out_offsets.data(), mm + h.out_offsets_off, out_offsets_bytes);
+      DestID_* out_neigh = reinterpret_cast<DestID_*>(const_cast<unsigned char*>(mm + h.out_neigh_off));
+      DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+
+      if (!directed) {
+        return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh);
+      }
+      if (has_inverse) {
+        const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+        pvector<SGOffset> in_offsets(nn + 1);
+        std::memcpy(in_offsets.data(), mm + h.in_offsets_off, in_offsets_bytes);
+        DestID_* in_neigh =
+            reinterpret_cast<DestID_*>(const_cast<unsigned char*>(mm + h.in_neigh_off));
+        DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+        return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, in_index, in_neigh);
+      }
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, nullptr, nullptr);
+    }
+
+#ifndef GAPBS_CXL_SECURE
+    (void)out_neigh_bytes;
+    std::cerr << "[gapbs] CXL graph is encrypted, but this binary was built without GAPBS_CXL_SECURE"
+              << std::endl;
+    std::exit(-135);
+#else
+    if (!gapbs::cxl_sec::EnvEnabled("CXL_SEC_ENABLE")) {
+      std::cerr << "[gapbs] CXL graph is encrypted; set CXL_SEC_ENABLE=1 and configure CXL_SEC_MGR or CXL_SEC_KEY_HEX"
+                << std::endl;
+      std::exit(-136);
+    }
+
+    static const uint8_t kSecDirGraph = 3;
+    static const uint8_t kRegionOutOffsets = 0;
+    static const uint8_t kRegionOutNeigh = 1;
+    static const uint8_t kRegionInOffsets = 2;
+    static const uint8_t kRegionInNeigh = 3;
+
+    gapbs::cxl_sec::Client sec;
+    sec.InitFromEnvOrExit(reinterpret_cast<unsigned char*>(shm.base()));
+    sec.WaitTableReadyOrExit(gapbs::cxl_sec::GetEnvU32("CXL_SEC_TIMEOUT_MS", 10000));
+
+    const uint32_t local_id = gapbs::cxl_sec::GetEnvU32("CXL_SEC_NODE_ID", 1);
+    const bool multi_key = !sec.uses_mgr() && ((h.flags & kFlagHasPublic) != 0) && (h.owner_id != 0);
+    const bool use_public = multi_key && (local_id != h.owner_id);
+
+    if (use_public) {
+      if (h.pub_out_offsets_off == 0 || h.pub_out_neigh_off == 0) {
+        std::cerr << "[gapbs] CXL graph public copy missing but required (owner_id=" << h.owner_id
+                  << ", local_id=" << local_id << ")" << std::endl;
+        std::exit(-137);
+      }
+      if (has_inverse && (h.pub_in_offsets_off == 0 || h.pub_in_neigh_off == 0)) {
+        std::cerr << "[gapbs] CXL graph public inverse copy missing but required" << std::endl;
+        std::exit(-138);
+      }
+    }
+
+    const uint64_t out_offsets_off = use_public ? h.pub_out_offsets_off : h.out_offsets_off;
+    const uint64_t out_neigh_off = use_public ? h.pub_out_neigh_off : h.out_neigh_off;
+    const uint64_t in_offsets_off = use_public ? h.pub_in_offsets_off : h.in_offsets_off;
+    const uint64_t in_neigh_off = use_public ? h.pub_in_neigh_off : h.in_neigh_off;
+
+    auto get_key = [&](uint64_t off, uint64_t len, unsigned char out_key[crypto_stream_chacha20_ietf_KEYBYTES]) {
+      if (sec.uses_mgr()) {
+        sec.GetKeyForRangeOrExit(off, len, out_key);
+        return;
+      }
+      if (use_public) {
+        sec.GetCommonKeyOrExit(out_key);
+      } else {
+        sec.GetVmKeyOrExit(out_key);
+      }
+    };
+
+    pvector<SGOffset> out_offsets(nn + 1);
+    std::memcpy(out_offsets.data(), mm + out_offsets_off, out_offsets_bytes);
+    unsigned char key_out_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+    get_key(out_offsets_off, out_offsets_bytes, key_out_offsets);
+    gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_offsets.data()), out_offsets_bytes, kSecDirGraph,
+                          kRegionOutOffsets, 0, key_out_offsets);
+
+    DestID_* out_neigh = new DestID_[out_entries];
+    std::memcpy(out_neigh, mm + out_neigh_off, out_neigh_bytes);
+    unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+    get_key(out_neigh_off, out_neigh_bytes, key_out_neigh);
+    gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_neigh), out_neigh_bytes, kSecDirGraph, kRegionOutNeigh,
+                          0, key_out_neigh);
+
+    DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+
+    if (!directed) {
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh);
+    }
+
+    if (has_inverse) {
+      const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+      pvector<SGOffset> in_offsets(nn + 1);
+      std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
+      unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+      get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
+      gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
+                            kRegionInOffsets, 0, key_in_offsets);
+
+      const size_t in_entries = static_cast<size_t>(in_offsets[n]);
+      const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+      DestID_* in_neigh = new DestID_[in_entries];
+      std::memcpy(in_neigh, mm + in_neigh_off, in_neigh_bytes);
+      unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+      get_key(in_neigh_off, in_neigh_bytes, key_in_neigh);
+      gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_neigh), in_neigh_bytes, kSecDirGraph, kRegionInNeigh,
+                            0, key_in_neigh);
+
+      DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, in_index, in_neigh);
+    }
+
+    return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, nullptr, nullptr);
+#endif
+  }
+
+  CSRGraph<NodeID_, DestID_, invert> PublishToCxlShm(CSRGraph<NodeID_, DestID_, invert> g) {
+    using gapbs::cxl_graph::Header;
+    using gapbs::cxl_graph::kFlagDirected;
+    using gapbs::cxl_graph::kFlagEncrypted;
+    using gapbs::cxl_graph::kFlagHasPublic;
     using gapbs::cxl_graph::kFlagHasInverse;
     using gapbs::cxl_graph::kFlagWeighted;
     using gapbs::cxl_graph::kMagic;
     using gapbs::cxl_graph::kVersion;
 
+    const bool publish_only = EnvEnabledLocal("GAPBS_CXL_PUBLISH_ONLY");
+    const bool secure = gapbs::cxl_sec::EnvEnabled("CXL_SEC_ENABLE");
+    const char* common_hex_env = std::getenv("CXL_SEC_COMMON_KEY_HEX");
+    const char* mgr_env = std::getenv("CXL_SEC_MGR");
+    const bool want_public = secure && (common_hex_env != nullptr) && (*common_hex_env != '\0') &&
+                             (mgr_env == nullptr || *mgr_env == '\0');
+
     gapbs::cxl_graph::ResetRegion();
-    gapbs::cxl_shm::Mapping &shm = gapbs::cxl_shm::Global();
+    gapbs::cxl_shm::Mapping& shm = gapbs::cxl_shm::Global();
 
     const int64_t n = g.num_nodes();
     const bool directed = g.directed();
     const bool weighted = !std::is_same<NodeID_, DestID_>::value;
-    const bool has_inverse = directed && (g.in_index() != nullptr) &&
-                             (g.in_neighbors() != nullptr);
+    const bool has_inverse = directed && (g.in_index() != nullptr) && (g.in_neighbors() != nullptr);
 
     pvector<SGOffset> out_offsets = g.VertexOffsets(false);
     const size_t out_entries = static_cast<size_t>(out_offsets[n]);
 
-    SGOffset *out_offsets_shm = shm.AllocArray<SGOffset>(n + 1, 64);
-    std::memcpy(out_offsets_shm, out_offsets.data(),
-                static_cast<size_t>(n + 1) * sizeof(SGOffset));
+    SGOffset* out_offsets_shm = shm.AllocArray<SGOffset>(static_cast<size_t>(n + 1), 64);
+    std::memcpy(out_offsets_shm, out_offsets.data(), static_cast<size_t>(n + 1) * sizeof(SGOffset));
 
-    DestID_ *out_neigh_shm = shm.AllocArray<DestID_>(out_entries, 64);
-    std::memcpy(out_neigh_shm, g.out_neighbors(),
-                out_entries * sizeof(DestID_));
+    DestID_* out_neigh_shm = shm.AllocArray<DestID_>(out_entries, 64);
+    std::memcpy(out_neigh_shm, g.out_neighbors(), out_entries * sizeof(DestID_));
 
-    DestID_ **out_index =
-        CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh_shm);
-
-    DestID_ **in_index = nullptr;
-    DestID_ *in_neigh_shm = nullptr;
-    SGOffset *in_offsets_shm = nullptr;
+    SGOffset* in_offsets_shm = nullptr;
+    DestID_* in_neigh_shm = nullptr;
     pvector<SGOffset> in_offsets;
     size_t in_entries = 0;
     if (has_inverse) {
       in_offsets = g.VertexOffsets(true);
       in_entries = static_cast<size_t>(in_offsets[n]);
-      in_offsets_shm = shm.AllocArray<SGOffset>(n + 1, 64);
-      std::memcpy(in_offsets_shm, in_offsets.data(),
-                  static_cast<size_t>(n + 1) * sizeof(SGOffset));
+      in_offsets_shm = shm.AllocArray<SGOffset>(static_cast<size_t>(n + 1), 64);
+      std::memcpy(in_offsets_shm, in_offsets.data(), static_cast<size_t>(n + 1) * sizeof(SGOffset));
       in_neigh_shm = shm.AllocArray<DestID_>(in_entries, 64);
       std::memcpy(in_neigh_shm, g.in_neighbors(), in_entries * sizeof(DestID_));
-      in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets,
-                                                             in_neigh_shm);
+    }
+
+    SGOffset* pub_out_offsets_shm = nullptr;
+    DestID_* pub_out_neigh_shm = nullptr;
+    SGOffset* pub_in_offsets_shm = nullptr;
+    DestID_* pub_in_neigh_shm = nullptr;
+    if (want_public) {
+      pub_out_offsets_shm = shm.AllocArray<SGOffset>(static_cast<size_t>(n + 1), 64);
+      std::memcpy(pub_out_offsets_shm, out_offsets.data(), static_cast<size_t>(n + 1) * sizeof(SGOffset));
+      pub_out_neigh_shm = shm.AllocArray<DestID_>(out_entries, 64);
+      std::memcpy(pub_out_neigh_shm, g.out_neighbors(), out_entries * sizeof(DestID_));
+      if (has_inverse) {
+        pub_in_offsets_shm = shm.AllocArray<SGOffset>(static_cast<size_t>(n + 1), 64);
+        std::memcpy(pub_in_offsets_shm, in_offsets.data(), static_cast<size_t>(n + 1) * sizeof(SGOffset));
+        pub_in_neigh_shm = shm.AllocArray<DestID_>(in_entries, 64);
+        std::memcpy(pub_in_neigh_shm, g.in_neighbors(), in_entries * sizeof(DestID_));
+      }
     }
 
     const uintptr_t base = reinterpret_cast<uintptr_t>(shm.base());
@@ -119,48 +345,138 @@ class BuilderBase {
     h.magic = kMagic;
     h.version = kVersion;
     h.flags = 0;
-    if (directed)
-      h.flags |= kFlagDirected;
-    if (has_inverse)
-      h.flags |= kFlagHasInverse;
-    if (weighted)
-      h.flags |= kFlagWeighted;
+    if (directed) h.flags |= kFlagDirected;
+    if (has_inverse) h.flags |= kFlagHasInverse;
+    if (weighted) h.flags |= kFlagWeighted;
+    if (secure) h.flags |= kFlagEncrypted;
+    if (want_public) h.flags |= kFlagHasPublic;
     h.num_nodes = static_cast<uint64_t>(n);
     h.num_edges_directed = static_cast<uint64_t>(out_entries);
     h.dest_bytes = static_cast<uint32_t>(sizeof(DestID_));
-
-    h.out_offsets_off =
-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_offsets_shm) -
-                              base);
-    h.out_neigh_off =
-        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_neigh_shm) - base);
+    h.owner_id = secure ? static_cast<uint32_t>(EnvU32Local("CXL_SEC_NODE_ID", 1)) : 0;
+    h.out_offsets_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_offsets_shm) - base);
+    h.out_neigh_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(out_neigh_shm) - base);
     if (has_inverse) {
-      h.in_offsets_off =
-          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_offsets_shm) -
-                                base);
-      h.in_neigh_off =
-          static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_neigh_shm) -
-                                base);
+      h.in_offsets_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_offsets_shm) - base);
+      h.in_neigh_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(in_neigh_shm) - base);
+    }
+    if (want_public) {
+      h.pub_out_offsets_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pub_out_offsets_shm) - base);
+      h.pub_out_neigh_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pub_out_neigh_shm) - base);
+      if (has_inverse) {
+        h.pub_in_offsets_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pub_in_offsets_shm) - base);
+        h.pub_in_neigh_off = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pub_in_neigh_shm) - base);
+      }
     }
     h.total_bytes = static_cast<uint64_t>(shm.used());
-    h.ready = 0;
+    h.ready = secure ? 0 : 1;
     gapbs::cxl_graph::Publish(h);
-    std::cerr << "[gapbs] CXL graph published: nodes=" << n
-              << " out_entries=" << out_entries
-              << " directed=" << (directed ? 1 : 0)
-              << " inverse=" << (has_inverse ? 1 : 0)
-              << " total_bytes=" << h.total_bytes << std::endl;
 
+#ifdef GAPBS_CXL_SECURE
+    if (secure) {
+      static const uint8_t kSecDirGraph = 3;
+      static const uint8_t kRegionOutOffsets = 0;
+      static const uint8_t kRegionOutNeigh = 1;
+      static const uint8_t kRegionInOffsets = 2;
+      static const uint8_t kRegionInNeigh = 3;
+
+      gapbs::cxl_sec::Client seccli;
+      seccli.InitFromEnvOrExit(reinterpret_cast<unsigned char*>(shm.base()));
+      seccli.WaitTableReadyOrExit(gapbs::cxl_sec::GetEnvU32("CXL_SEC_TIMEOUT_MS", 10000));
+
+      const size_t out_offsets_bytes = (static_cast<size_t>(n) + 1) * sizeof(SGOffset);
+      const size_t out_neigh_bytes = out_entries * sizeof(DestID_);
+
+      if (seccli.uses_mgr()) {
+        unsigned char key_out_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+        seccli.GetKeyForRangeOrExit(h.out_offsets_off, out_offsets_bytes, key_out_offsets);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_offsets_shm), out_offsets_bytes, kSecDirGraph,
+                              kRegionOutOffsets, 0, key_out_offsets);
+
+        unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+        seccli.GetKeyForRangeOrExit(h.out_neigh_off, out_neigh_bytes, key_out_neigh);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_neigh_shm), out_neigh_bytes, kSecDirGraph,
+                              kRegionOutNeigh, 0, key_out_neigh);
+      } else {
+        unsigned char vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+        seccli.GetVmKeyOrExit(vm_key);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_offsets_shm), out_offsets_bytes, kSecDirGraph,
+                              kRegionOutOffsets, 0, vm_key);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_neigh_shm), out_neigh_bytes, kSecDirGraph,
+                              kRegionOutNeigh, 0, vm_key);
+
+        if (want_public) {
+          unsigned char common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+          seccli.GetCommonKeyOrExit(common_key);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(pub_out_offsets_shm), out_offsets_bytes, kSecDirGraph,
+                                kRegionOutOffsets, 0, common_key);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(pub_out_neigh_shm), out_neigh_bytes, kSecDirGraph,
+                                kRegionOutNeigh, 0, common_key);
+        }
+      }
+
+      if (has_inverse) {
+        const size_t in_offsets_bytes = (static_cast<size_t>(n) + 1) * sizeof(SGOffset);
+        const size_t in_neigh_bytes = in_entries * sizeof(DestID_);
+
+        if (seccli.uses_mgr()) {
+          unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+          seccli.GetKeyForRangeOrExit(h.in_offsets_off, in_offsets_bytes, key_in_offsets);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets_shm), in_offsets_bytes, kSecDirGraph,
+                                kRegionInOffsets, 0, key_in_offsets);
+
+          unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+          seccli.GetKeyForRangeOrExit(h.in_neigh_off, in_neigh_bytes, key_in_neigh);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_neigh_shm), in_neigh_bytes, kSecDirGraph,
+                                kRegionInNeigh, 0, key_in_neigh);
+        } else {
+          unsigned char vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+          seccli.GetVmKeyOrExit(vm_key);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets_shm), in_offsets_bytes, kSecDirGraph,
+                                kRegionInOffsets, 0, vm_key);
+          gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_neigh_shm), in_neigh_bytes, kSecDirGraph,
+                                kRegionInNeigh, 0, vm_key);
+
+          if (want_public) {
+            unsigned char common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+            seccli.GetCommonKeyOrExit(common_key);
+            gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(pub_in_offsets_shm), in_offsets_bytes, kSecDirGraph,
+                                  kRegionInOffsets, 0, common_key);
+            gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(pub_in_neigh_shm), in_neigh_bytes, kSecDirGraph,
+                                  kRegionInNeigh, 0, common_key);
+          }
+        }
+      }
+
+      Header h_done = h;
+      h_done.ready = 1;
+      gapbs::cxl_graph::Publish(h_done);
+    }
+#endif
+
+    std::cerr << "[gapbs] CXL graph published: nodes=" << n << " out_entries=" << out_entries
+              << " directed=" << (directed ? 1 : 0) << " inverse=" << (has_inverse ? 1 : 0)
+              << " encrypted=" << (secure ? 1 : 0) << " total_bytes=" << h.total_bytes << std::endl;
+
+    if (publish_only) {
+      std::cerr << "[gapbs] GAPBS_CXL_PUBLISH_ONLY=1: publish done, exiting." << std::endl;
+      std::exit(0);
+    }
+
+    if (secure) {
+      // Shared-memory graph is encrypted-at-rest; keep computation on the local graph.
+      return g;
+    }
+
+    DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh_shm);
     if (!directed) {
       return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm);
     }
     if (has_inverse) {
-      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm,
-                                                in_index, in_neigh_shm);
+      DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh_shm);
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm, in_index, in_neigh_shm);
     }
-    // Directed graph without inverse edges.
-    return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm,
-                                              nullptr, nullptr);
+    return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh_shm, nullptr, nullptr);
   }
 #endif
 
@@ -447,6 +763,18 @@ class BuilderBase {
   }
 
   CSRGraph<NodeID_, DestID_, invert> MakeGraph() {
+#ifdef GAPBS_CXL_SHM
+    // Multi-process/multi-host workflows may publish the graph once into shared
+    // memory and have other processes attach to it.
+    const CxlMode mode = GetCxlMode();
+    if (mode == CxlMode::kAttach) {
+      return LoadFromCxlShm();
+    }
+    if (mode == CxlMode::kAuto && gapbs::cxl_graph::Ready()) {
+      return LoadFromCxlShm();
+    }
+#endif
+
     CSRGraph<NodeID_, DestID_, invert> g;
     bool serialized = false;
     {  // extra scope to trigger earlier deletion of el (save memory)
@@ -469,7 +797,7 @@ class BuilderBase {
     if (!in_place_ && !serialized)
       g = SquishGraph(g);
 #ifdef GAPBS_CXL_SHM
-    return CopyToCxlShm(g);
+    return PublishToCxlShm(std::move(g));
 #else
     return g;
 #endif
