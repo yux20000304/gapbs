@@ -226,11 +226,17 @@ class CSRGraph {
   }
 
   Neighborhood out_neigh(NodeID_ n, OffsetT start_offset = 0) const {
+#ifdef GAPBS_CXL_SHM
+    gapbs::cxl_shm::ShmDelayMaybe(out_neighbors_);
+#endif
     return Neighborhood(n, out_index_, start_offset);
   }
 
   Neighborhood in_neigh(NodeID_ n, OffsetT start_offset = 0) const {
     static_assert(MakeInverse, "Graph inversion disabled but reading inverse");
+#ifdef GAPBS_CXL_SHM
+    gapbs::cxl_shm::ShmDelayMaybe(in_neighbors_);
+#endif
     return Neighborhood(n, in_index_, start_offset);
   }
 

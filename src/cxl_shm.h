@@ -18,6 +18,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <time.h>
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -74,6 +76,57 @@ inline bool ParseSizeBytes(const std::string& s, size_t* out_bytes) {
 
 inline size_t AlignUp(size_t n, size_t a) {
   return (n + (a - 1)) & ~(a - 1);
+}
+
+inline uint64_t NowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+inline uint64_t ShmDelayNsFromEnv() {
+  static uint64_t delay_ns = []() -> uint64_t {
+    const char* v = std::getenv("CXL_SHM_DELAY_NS");
+    if (!v || !*v)
+      return 0;
+    errno = 0;
+    unsigned long long ns = std::strtoull(v, nullptr, 0);
+    if (errno != 0)
+      return 0;
+    return static_cast<uint64_t>(ns);
+  }();
+  return delay_ns;
+}
+
+inline uint64_t PauseItersPerNsX1024() {
+  static uint64_t iters_per_ns_x1024 = 0;
+  if (iters_per_ns_x1024)
+    return iters_per_ns_x1024;
+
+  const uint64_t iters = 5000000ULL;
+  uint64_t start = NowNs();
+  for (uint64_t i = 0; i < iters; i++) {
+    __asm__ __volatile__("pause");
+  }
+  uint64_t dt = NowNs() - start;
+  if (dt == 0)
+    dt = 1;
+  iters_per_ns_x1024 = (iters * 1024ULL) / dt;
+  if (iters_per_ns_x1024 == 0)
+    iters_per_ns_x1024 = 1;
+  return iters_per_ns_x1024;
+}
+
+inline void ShmDelayForNs(uint64_t ns) {
+  if (!ns)
+    return;
+  const uint64_t iters_per_ns_x1024 = PauseItersPerNsX1024();
+  uint64_t iters = (ns * iters_per_ns_x1024 + 1023ULL) / 1024ULL;
+  if (iters == 0)
+    iters = 1;
+  for (uint64_t i = 0; i < iters; i++) {
+    __asm__ __volatile__("pause");
+  }
 }
 
 class Mapping {
@@ -251,6 +304,15 @@ inline Mapping& Global() {
 
 inline bool PtrInCxlShm(const void* p) {
   return Global().Contains(p);
+}
+
+inline void ShmDelayMaybe(const void* p) {
+  uint64_t ns = ShmDelayNsFromEnv();
+  if (!ns)
+    return;
+  if (!PtrInCxlShm(p))
+    return;
+  ShmDelayForNs(ns);
 }
 
 }  // namespace cxl_shm
