@@ -131,7 +131,7 @@ inline void ShmDelayForNs(uint64_t ns) {
 
 class Mapping {
  public:
-  Mapping() : fd_(-1), base_(nullptr), size_(0), next_off_(0) {}
+  Mapping() : fd_(-1), base_(nullptr), size_(0), map_offset_(0), next_off_(0) {}
 
   ~Mapping() {
     if (base_ != nullptr && size_ != 0) {
@@ -174,10 +174,24 @@ class Mapping {
       std::exit(-101);
     }
 
-    Init(path, map_size);
+    size_t map_offset = 0;
+    std::string off_str = GetEnvStr("GAPBS_CXL_MAP_OFFSET");
+    if (off_str.empty())
+      off_str = GetEnvStr("CXL_SHM_OFFSET");
+    if (off_str.empty())
+      off_str = GetEnvStr("CXL_RING_OFFSET");
+    if (!off_str.empty()) {
+      if (!ParseSizeBytes(off_str, &map_offset)) {
+        std::cerr << "[gapbs] Invalid GAPBS_CXL_MAP_OFFSET: '" << off_str << "'"
+                  << std::endl;
+        std::exit(-102);
+      }
+    }
+
+    Init(path, map_size, map_offset);
   }
 
-  void Init(const std::string& path, size_t map_size) {
+  void Init(const std::string& path, size_t map_size, size_t map_offset) {
     if (Initialized()) {
       std::cerr << "[gapbs] CXL shm mapping already initialized" << std::endl;
       std::exit(-102);
@@ -185,6 +199,12 @@ class Mapping {
     if (map_size == 0) {
       std::cerr << "[gapbs] CXL shm map size must be > 0" << std::endl;
       std::exit(-103);
+    }
+    long page = sysconf(_SC_PAGESIZE);
+    if (page > 0 && (map_offset % static_cast<size_t>(page)) != 0) {
+      std::cerr << "[gapbs] CXL shm map offset not page-aligned: " << map_offset
+                << std::endl;
+      std::exit(-120);
     }
 
     // Try open without O_CREAT first (device-like files in /sys won't support
@@ -209,18 +229,31 @@ class Mapping {
 
     // Ensure regular files are large enough.
     if (S_ISREG(st.st_mode)) {
-      if (static_cast<size_t>(st.st_size) < map_size) {
-        if (ftruncate(fd, static_cast<off_t>(map_size)) != 0) {
-          std::cerr << "[gapbs] ftruncate(" << path << ", " << map_size
-                    << ") failed: " << std::strerror(errno) << std::endl;
+      size_t need = map_size;
+      if (map_offset > 0) {
+        if (map_offset > static_cast<size_t>(-1) - map_size) {
+          std::cerr << "[gapbs] CXL shm map offset too large" << std::endl;
           close(fd);
-          std::exit(-106);
+          std::exit(-121);
+        }
+        need = map_offset + map_size;
+      }
+      if (static_cast<size_t>(st.st_size) < need) {
+        if (ftruncate(fd, static_cast<off_t>(need)) != 0) {
+          if (static_cast<size_t>(st.st_size) > map_offset) {
+            map_size = static_cast<size_t>(st.st_size) - map_offset;
+          } else {
+            std::cerr << "[gapbs] ftruncate(" << path << ", " << need
+                      << ") failed: " << std::strerror(errno) << std::endl;
+            close(fd);
+            std::exit(-106);
+          }
         }
       }
     }
 
     void* base = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
-                      0);
+                      static_cast<off_t>(map_offset));
     if (base == MAP_FAILED) {
       std::cerr << "[gapbs] mmap(" << path << ", " << map_size << ") failed: "
                 << std::strerror(errno) << std::endl;
@@ -231,11 +264,12 @@ class Mapping {
     fd_ = fd;
     base_ = base;
     size_ = map_size;
+    map_offset_ = map_offset;
     next_off_ = 0;
     path_ = path;
 
     std::cerr << "[gapbs] CXL shm mapped: path=" << path_ << " size=" << size_
-              << " base=" << base_ << std::endl;
+              << " offset=" << map_offset_ << " base=" << base_ << std::endl;
   }
 
   bool Initialized() const { return base_ != nullptr && size_ != 0; }
@@ -284,7 +318,7 @@ class Mapping {
     return x >= b && x < (b + size_);
   }
 
-  void* base() const { return base_; }
+ void* base() const { return base_; }
   size_t size() const { return size_; }
   size_t used() const { return next_off_; }
   const std::string& path() const { return path_; }
@@ -293,6 +327,7 @@ class Mapping {
   int fd_;
   void* base_;
   size_t size_;
+  size_t map_offset_;
   size_t next_off_;
   std::string path_;
 };
