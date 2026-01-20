@@ -95,7 +95,11 @@ inline void Publish(const Header& h) {
 
 inline bool Ready() {
   Header* h = GetHeader();
-  return h->magic == kMagic && h->version == kVersion && h->ready == 1;
+  if (h->magic != kMagic || h->version != kVersion || h->ready != 1)
+    return false;
+  // Ensure subsequent reads observe the published graph contents.
+  __sync_synchronize();
+  return true;
 }
 
 }  // namespace cxl_graph
