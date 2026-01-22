@@ -114,15 +114,45 @@ class BuilderBase {
     using gapbs::cxl_graph::kFlagHasInverse;
     using gapbs::cxl_graph::kVersion;
 
+    const uint64_t attach_t0 = gapbs::cxl_shm::NowNs();
+    uint64_t wait_ms = 0;
+    uint64_t decrypt_ms = 0;
+    uint64_t pretouch_ms = 0;
+
+    const bool pretouch = EnvEnabledLocal("GAPBS_CXL_PRETOUCH");
+    auto do_pretouch = [&](const void* ptr, size_t len) {
+      if (!pretouch || !ptr || len == 0) return;
+      long page = sysconf(_SC_PAGESIZE);
+      const size_t step = (page > 0) ? static_cast<size_t>(page) : 4096;
+      const volatile unsigned char* p = reinterpret_cast<const volatile unsigned char*>(ptr);
+      volatile unsigned char sink = 0;
+      for (size_t off = 0; off < len; off += step) {
+        sink ^= p[off];
+      }
+      sink ^= p[len - 1];
+      (void)sink;
+    };
+
+    auto log_attach = [&]() {
+      const uint64_t total_ms = (gapbs::cxl_shm::NowNs() - attach_t0) / 1000000ULL;
+      std::cerr << "[gapbs] CXL attach: total_ms=" << total_ms
+                << " wait_ms=" << wait_ms
+                << " decrypt_ms=" << decrypt_ms
+                << " pretouch_ms=" << pretouch_ms
+                << std::endl;
+    };
+
     gapbs::cxl_shm::Mapping& shm = gapbs::cxl_shm::Global();
     shm.InitFromEnv();
 
     unsigned timeout_ms = EnvU32Local("GAPBS_CXL_ATTACH_TIMEOUT_MS", 30000);
+    const uint64_t wait_t0 = gapbs::cxl_shm::NowNs();
     if (!WaitGraphReady(timeout_ms)) {
       std::cerr << "[gapbs] CXL graph not ready after " << timeout_ms << " ms"
                 << std::endl;
       std::exit(-131);
     }
+    wait_ms = (gapbs::cxl_shm::NowNs() - wait_t0) / 1000000ULL;
 
     const Header* hdr = gapbs::cxl_graph::GetHeader();
     Header h = *hdr;
@@ -160,6 +190,10 @@ class BuilderBase {
       DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
 
       if (!directed) {
+        const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+        do_pretouch(out_neigh, out_neigh_bytes);
+        pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+        log_attach();
         return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh);
       }
       if (has_inverse) {
@@ -169,8 +203,19 @@ class BuilderBase {
         DestID_* in_neigh =
             reinterpret_cast<DestID_*>(const_cast<unsigned char*>(mm + h.in_neigh_off));
         DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+        const size_t in_entries = static_cast<size_t>(in_offsets[n]);
+        const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+        const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+        do_pretouch(out_neigh, out_neigh_bytes);
+        do_pretouch(in_neigh, in_neigh_bytes);
+        pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+        log_attach();
         return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, in_index, in_neigh);
       }
+      const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+      do_pretouch(out_neigh, out_neigh_bytes);
+      pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+      log_attach();
       return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, nullptr, nullptr);
     }
 
@@ -180,6 +225,7 @@ class BuilderBase {
               << std::endl;
     std::exit(-135);
 #else
+    const uint64_t dec_t0 = gapbs::cxl_shm::NowNs();
     if (!gapbs::cxl_sec::EnvEnabled("CXL_SEC_ENABLE")) {
       std::cerr << "[gapbs] CXL graph is encrypted; set CXL_SEC_ENABLE=1 and configure CXL_SEC_MGR or CXL_SEC_KEY_HEX"
                 << std::endl;
@@ -308,27 +354,46 @@ class BuilderBase {
       }
     });
 
+    decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+
     DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
 
     if (!directed) {
+      const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+      do_pretouch(out_neigh, out_neigh_bytes);
+      pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+      log_attach();
       return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh);
     }
 
     if (has_inverse) {
       const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
       pvector<SGOffset> in_offsets(nn + 1);
+      const uint64_t dec2_t0 = gapbs::cxl_shm::NowNs();
       std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
       unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
       get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
       gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
                             kRegionInOffsets, 0, key_in_offsets);
+      decrypt_ms += (gapbs::cxl_shm::NowNs() - dec2_t0) / 1000000ULL;
 
       DestID_* in_neigh = reinterpret_cast<DestID_*>(base + in_neigh_off);
 
       DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+      const size_t in_entries = static_cast<size_t>(in_offsets[n]);
+      const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+      const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+      do_pretouch(out_neigh, out_neigh_bytes);
+      do_pretouch(in_neigh, in_neigh_bytes);
+      pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+      log_attach();
       return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, in_index, in_neigh);
     }
 
+    const uint64_t pt0 = gapbs::cxl_shm::NowNs();
+    do_pretouch(out_neigh, out_neigh_bytes);
+    pretouch_ms = (gapbs::cxl_shm::NowNs() - pt0) / 1000000ULL;
+    log_attach();
     return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, nullptr, nullptr);
 #endif
   }
