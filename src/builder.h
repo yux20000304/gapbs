@@ -283,11 +283,72 @@ class BuilderBase {
                           kRegionOutOffsets, 0, key_out_offsets);
 
     unsigned char* base = reinterpret_cast<unsigned char*>(shm.base());
-    DestID_* out_neigh = reinterpret_cast<DestID_*>(base + out_neigh_off);
+    DestID_* out_neigh_cipher = reinterpret_cast<DestID_*>(base + out_neigh_off);
 
-    // Decrypt shared-memory neighbor arrays in place, so benchmark access
-    // touches the shared memory region and triggers CXL_SHM_DELAY_NS.
-    // Note: This trades away "encrypted-at-rest during compute" semantics.
+    // Crypto mode (pre-shared key, no security manager): keep shared memory
+    // encrypted and decrypt into TD-private memory. This avoids in-place
+    // decryption that would otherwise materialize plaintext in the shared region.
+    const bool crypto_mode = !sec.uses_mgr();
+    if (crypto_mode) {
+      const uint64_t delay_ns = gapbs::cxl_shm::ShmDelayNsFromEnv();
+      auto copy_from_shm_with_delay = [&](void* dst, const void* src, size_t len) {
+        if (delay_ns && len && gapbs::cxl_shm::PtrInCxlShm(src))
+          gapbs::cxl_shm::ShmDelayForNs(delay_ns);
+        std::memcpy(dst, src, len);
+      };
+
+      DestID_* out_neigh = new DestID_[out_entries];
+      copy_from_shm_with_delay(out_neigh, out_neigh_cipher, out_neigh_bytes);
+      unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+      get_key(out_neigh_off, out_neigh_bytes, key_out_neigh);
+      gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_neigh), out_neigh_bytes, kSecDirGraph, kRegionOutNeigh,
+                            0, key_out_neigh);
+
+      if (!directed) {
+        decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+        DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+        log_attach();
+        return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh);
+      }
+
+      if (has_inverse) {
+        const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+        pvector<SGOffset> in_offsets(nn + 1);
+        std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
+        unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+        get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
+                              kRegionInOffsets, 0, key_in_offsets);
+
+        const size_t in_entries = static_cast<size_t>(in_offsets[n]);
+        const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+        DestID_* in_neigh_cipher = reinterpret_cast<DestID_*>(base + in_neigh_off);
+        DestID_* in_neigh = new DestID_[in_entries];
+        copy_from_shm_with_delay(in_neigh, in_neigh_cipher, in_neigh_bytes);
+        unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+        get_key(in_neigh_off, in_neigh_bytes, key_in_neigh);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_neigh), in_neigh_bytes, kSecDirGraph, kRegionInNeigh,
+                              0, key_in_neigh);
+
+        decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+        DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+        DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+        log_attach();
+        return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, in_index, in_neigh);
+      }
+
+      decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+      DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+      log_attach();
+      return CSRGraph<NodeID_, DestID_, invert>(n, out_index, out_neigh, nullptr, nullptr);
+    }
+
+    DestID_* out_neigh = out_neigh_cipher;
+
+    // Secure mode (security manager / per-range keys): decrypt shared-memory
+    // neighbor arrays in place, so benchmark access touches the shared memory
+    // region and triggers CXL_SHM_DELAY_NS. This trades away
+    // "encrypted-at-rest during compute" semantics.
     // Use a simple shared header flag to avoid multiple processes decrypting
     // the same range concurrently (XOR-based cipher would re-encrypt if applied twice).
     Header* hdr_mut = gapbs::cxl_graph::GetHeader();
