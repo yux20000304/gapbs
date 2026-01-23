@@ -57,7 +57,8 @@ void PBFS(const Graph &g, NodeID source, pvector<CountT> &path_counts,
   queue.push_back(source);
   depth_index.push_back(queue.begin());
   queue.slide_window();
-  const NodeID* g_out_start = g.out_neigh(0).begin();
+  const NodeID* out_base = g.out_neighbors();
+  NodeID** out_index = g.out_index();
   #pragma omp parallel
   {
     NodeID depth = 0;
@@ -67,13 +68,16 @@ void PBFS(const Graph &g, NodeID source, pvector<CountT> &path_counts,
       #pragma omp for schedule(dynamic, 64) nowait
       for (auto q_iter = queue.begin(); q_iter < queue.end(); q_iter++) {
         NodeID u = *q_iter;
-        for (NodeID &v : g.out_neigh(u)) {
+        size_t edge = static_cast<size_t>(out_index[u] - out_base);
+        auto neigh_u = g.out_neigh(u);
+        for (NodeID* p = neigh_u.begin(); p < neigh_u.end(); p++, edge++) {
+          NodeID v = *p;
           if ((depths[v] == -1) &&
               (compare_and_swap(depths[v], static_cast<NodeID>(-1), depth))) {
             lqueue.push_back(v);
           }
           if (depths[v] == depth) {
-            succ.set_bit_atomic(&v - g_out_start);
+            succ.set_bit_atomic(edge);
             #pragma omp atomic
             path_counts[v] += path_counts[u];
           }
@@ -104,7 +108,8 @@ pvector<ScoreT> Brandes(const Graph &g, SourcePicker<Graph> &sp,
   t.Stop();
   if (logging_enabled)
     PrintStep("a", t.Seconds());
-  const NodeID* g_out_start = g.out_neigh(0).begin();
+  const NodeID* out_base = g.out_neighbors();
+  NodeID** out_index = g.out_index();
   for (NodeID iter=0; iter < num_iters; iter++) {
     NodeID source = sp.PickNext();
     if (logging_enabled)
@@ -125,8 +130,11 @@ pvector<ScoreT> Brandes(const Graph &g, SourcePicker<Graph> &sp,
       for (auto it = depth_index[d]; it < depth_index[d+1]; it++) {
         NodeID u = *it;
         ScoreT delta_u = 0;
-        for (NodeID &v : g.out_neigh(u)) {
-          if (succ.get_bit(&v - g_out_start)) {
+        size_t edge = static_cast<size_t>(out_index[u] - out_base);
+        auto neigh_u = g.out_neigh(u);
+        for (NodeID* p = neigh_u.begin(); p < neigh_u.end(); p++, edge++) {
+          NodeID v = *p;
+          if (succ.get_bit(edge)) {
             delta_u += (path_counts[u] / path_counts[v]) * (1 + deltas[v]);
           }
         }

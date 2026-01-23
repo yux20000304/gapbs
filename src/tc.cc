@@ -53,16 +53,19 @@ size_t OrderedCount(const Graph &g) {
   size_t total = 0;
   #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
   for (NodeID u=0; u < g.num_nodes(); u++) {
-    for (NodeID v : g.out_neigh(u)) {
+    auto neigh_u = g.out_neigh(u);
+    for (NodeID v : neigh_u) {
       if (v > u)
         break;
-      auto it = g.out_neigh(v).begin();
-      for (NodeID w : g.out_neigh(u)) {
+      auto neigh_v = g.out_neigh(v);
+      auto it = neigh_v.begin();
+      auto it_end = neigh_v.end();
+      for (NodeID w : neigh_u) {
         if (w > v)
           break;
-        while (*it < w)
+        while (it != it_end && *it < w)
           it++;
-        if (w == *it)
+        if (it != it_end && w == *it)
           total++;
       }
     }
@@ -108,17 +111,17 @@ void PrintTriangleStats(const Graph &g, size_t total_triangles) {
 // Compares with simple serial implementation that uses std::set_intersection
 bool TCVerifier(const Graph &g, size_t test_total) {
   size_t total = 0;
-  vector<NodeID> intersection;
-  intersection.reserve(g.num_nodes());
+  vector<NodeID> intersection(g.num_nodes());
   for (NodeID u : g.vertices()) {
-    for (NodeID v : g.out_neigh(u)) {
-      auto new_end = set_intersection(g.out_neigh(u).begin(),
-                                      g.out_neigh(u).end(),
-                                      g.out_neigh(v).begin(),
-                                      g.out_neigh(v).end(),
+    auto neigh_u = g.out_neigh(u);
+    for (NodeID v : neigh_u) {
+      auto neigh_v = g.out_neigh(v);
+      auto new_end = set_intersection(neigh_u.begin(),
+                                      neigh_u.end(),
+                                      neigh_v.begin(),
+                                      neigh_v.end(),
                                       intersection.begin());
-      intersection.resize(new_end - intersection.begin());
-      total += intersection.size();
+      total += static_cast<size_t>(new_end - intersection.begin());
     }
   }
   total = total / 6;  // each triangle was counted 6 times

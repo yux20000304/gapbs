@@ -60,11 +60,11 @@ class WriterBase {
     out.write(reinterpret_cast<char*>(&num_nodes), sizeof(SGOffset));
     pvector<SGOffset> offsets = g_.VertexOffsets(false);
     out.write(reinterpret_cast<char*>(offsets.data()), index_bytes);
-    out.write(reinterpret_cast<char*>(g_.out_neigh(0).begin()), neigh_bytes);
+    out.write(reinterpret_cast<const char*>(g_.out_neighbors()), neigh_bytes);
     if (directed) {
       offsets = g_.VertexOffsets(true);
       out.write(reinterpret_cast<char*>(offsets.data()), index_bytes);
-      out.write(reinterpret_cast<char*>(g_.in_neigh(0).begin()), neigh_bytes);
+      out.write(reinterpret_cast<const char*>(g_.in_neighbors()), neigh_bytes);
     }
   }
 

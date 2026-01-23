@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 #include <iostream>
 #include <string>
@@ -182,6 +183,48 @@ inline void Crypt(unsigned char* buf, size_t len, uint8_t direction, uint8_t reg
   nonce[1] = region_id;
   std::memcpy(nonce + 4, &seq, sizeof(seq));
   crypto_stream_chacha20_ietf_xor(buf, buf, static_cast<unsigned long long>(len), nonce, key);
+}
+
+// Like Crypt(), but XOR the ChaCha20 keystream starting at a byte offset within the
+// (direction, region_id, seq) stream.
+//
+// This is useful for decrypting slices without needing to decrypt the whole region.
+inline void CryptAtOffset(unsigned char* buf, size_t len, uint8_t direction, uint8_t region_id, uint64_t seq,
+                          uint64_t byte_offset,
+                          const unsigned char key[crypto_stream_chacha20_ietf_KEYBYTES]) {
+  if (!buf || len == 0) return;
+
+  unsigned char nonce[crypto_stream_chacha20_ietf_NONCEBYTES];
+  std::memset(nonce, 0, sizeof(nonce));
+  nonce[0] = direction;
+  nonce[1] = region_id;
+  std::memcpy(nonce + 4, &seq, sizeof(seq));
+
+  // IETF ChaCha20 uses a 32-bit block counter with 64-byte blocks.
+  const uint64_t kBlockBytes = 64;
+  const uint64_t block = byte_offset / kBlockBytes;
+  const size_t skip = static_cast<size_t>(byte_offset % kBlockBytes);
+  if (block > 0xffffffffULL) {
+    std::cerr << "[gapbs] CXL sec: byte_offset too large for chacha20 counter: " << byte_offset << std::endl;
+    std::exit(-140);
+  }
+
+  if (skip == 0) {
+    crypto_stream_chacha20_ietf_xor_ic(buf, buf, static_cast<unsigned long long>(len), nonce, static_cast<uint32_t>(block),
+                                       key);
+    return;
+  }
+
+  // Decrypt starting at the previous block boundary. We don't need the real
+  // ciphertext for the skipped prefix; zero is fine since XOR(0, keystream) yields
+  // keystream and we discard it.
+  const size_t tmp_len = len + skip;
+  std::unique_ptr<unsigned char[]> tmp(new unsigned char[tmp_len]);
+  std::memset(tmp.get(), 0, skip);
+  std::memcpy(tmp.get() + skip, buf, len);
+  crypto_stream_chacha20_ietf_xor_ic(tmp.get(), tmp.get(), static_cast<unsigned long long>(tmp_len), nonce,
+                                     static_cast<uint32_t>(block), key);
+  std::memcpy(buf, tmp.get() + skip, len);
 }
 
 class Client {

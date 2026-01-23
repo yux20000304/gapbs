@@ -289,6 +289,55 @@ class BuilderBase {
     // encrypted and decrypt into TD-private memory. This avoids in-place
     // decryption that would otherwise materialize plaintext in the shared region.
     const bool crypto_mode = !sec.uses_mgr();
+    const char* lazy_env = std::getenv("GAPBS_CXL_CRYPTO_LAZY");
+    const bool crypto_lazy = crypto_mode && (!lazy_env || !*lazy_env || *lazy_env != '0');
+    if (crypto_mode && crypto_lazy) {
+      unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+      get_key(out_neigh_off, out_neigh_bytes, key_out_neigh);
+
+      DestID_* out_neigh = out_neigh_cipher;  // ciphertext in shared memory
+      DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
+
+      if (!directed) {
+        decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+        CSRGraph<NodeID_, DestID_, invert> g(n, out_index, out_neigh);
+        g.EnableCxlCryptoLazyOutOnly(kSecDirGraph, kRegionOutNeigh, key_out_neigh, 0);
+        log_attach();
+        return g;
+      }
+
+      if (has_inverse) {
+        const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+        pvector<SGOffset> in_offsets(nn + 1);
+        const uint64_t dec2_t0 = gapbs::cxl_shm::NowNs();
+        std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
+        unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
+        get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
+        gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
+                              kRegionInOffsets, 0, key_in_offsets);
+        decrypt_ms += (gapbs::cxl_shm::NowNs() - dec2_t0) / 1000000ULL;
+
+        const size_t in_entries = static_cast<size_t>(in_offsets[n]);
+        const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+        DestID_* in_neigh = reinterpret_cast<DestID_*>(base + in_neigh_off);  // ciphertext in shared memory
+        unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
+        get_key(in_neigh_off, in_neigh_bytes, key_in_neigh);
+
+        DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
+        CSRGraph<NodeID_, DestID_, invert> g(n, out_index, out_neigh, in_index, in_neigh);
+        g.EnableCxlCryptoLazy(kSecDirGraph, kRegionOutNeigh, key_out_neigh, kRegionInNeigh, key_in_neigh, 0);
+        decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+        log_attach();
+        return g;
+      }
+
+      decrypt_ms = (gapbs::cxl_shm::NowNs() - dec_t0) / 1000000ULL;
+      CSRGraph<NodeID_, DestID_, invert> g(n, out_index, out_neigh, nullptr, nullptr);
+      g.EnableCxlCryptoLazyOutOnly(kSecDirGraph, kRegionOutNeigh, key_out_neigh, 0);
+      log_attach();
+      return g;
+    }
+
     if (crypto_mode) {
       const uint64_t delay_ns = gapbs::cxl_shm::ShmDelayNsFromEnv();
       auto copy_from_shm_with_delay = [&](void* dst, const void* src, size_t len) {
@@ -747,16 +796,11 @@ class BuilderBase {
   void SquishCSR(const CSRGraph<NodeID_, DestID_, invert> &g, bool transpose,
                  DestID_*** sq_index, DestID_** sq_neighs) {
     pvector<NodeID_> diffs(g.num_nodes());
-    DestID_ *n_start, *n_end;
-    #pragma omp parallel for private(n_start, n_end)
+    #pragma omp parallel for
     for (NodeID_ n=0; n < g.num_nodes(); n++) {
-      if (transpose) {
-        n_start = g.in_neigh(n).begin();
-        n_end = g.in_neigh(n).end();
-      } else {
-        n_start = g.out_neigh(n).begin();
-        n_end = g.out_neigh(n).end();
-      }
+      auto neigh = transpose ? g.in_neigh(n) : g.out_neigh(n);
+      DestID_* n_start = neigh.begin();
+      DestID_* n_end = neigh.end();
       std::sort(n_start, n_end);
       DestID_ *new_end = std::unique(n_start, n_end);
       new_end = std::remove(n_start, new_end, n);
@@ -765,12 +809,10 @@ class BuilderBase {
     pvector<SGOffset> sq_offsets = ParallelPrefixSum(diffs);
     *sq_neighs = new DestID_[sq_offsets[g.num_nodes()]];
     *sq_index = CSRGraph<NodeID_, DestID_>::GenIndex(sq_offsets, *sq_neighs);
-    #pragma omp parallel for private(n_start)
+    #pragma omp parallel for
     for (NodeID_ n=0; n < g.num_nodes(); n++) {
-      if (transpose)
-        n_start = g.in_neigh(n).begin();
-      else
-        n_start = g.out_neigh(n).begin();
+      auto neigh = transpose ? g.in_neigh(n) : g.out_neigh(n);
+      DestID_* n_start = neigh.begin();
       std::copy(n_start, n_start+diffs[n], (*sq_index)[n]);
     }
   }
