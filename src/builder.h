@@ -117,6 +117,7 @@ class BuilderBase {
     const uint64_t attach_t0 = gapbs::cxl_shm::NowNs();
     uint64_t wait_ms = 0;
     uint64_t decrypt_ms = 0;
+    uint64_t rekey_ms = 0;
     uint64_t pretouch_ms = 0;
 
     const bool pretouch = EnvEnabledLocal("GAPBS_CXL_PRETOUCH");
@@ -138,6 +139,7 @@ class BuilderBase {
       std::cerr << "[gapbs] CXL attach: total_ms=" << total_ms
                 << " wait_ms=" << wait_ms
                 << " decrypt_ms=" << decrypt_ms
+                << " rekey_ms=" << rekey_ms
                 << " pretouch_ms=" << pretouch_ms
                 << std::endl;
     };
@@ -263,12 +265,16 @@ class BuilderBase {
     const uint64_t in_offsets_off = use_public ? h.pub_in_offsets_off : h.in_offsets_off;
     const uint64_t in_neigh_off = use_public ? h.pub_in_neigh_off : h.in_neigh_off;
 
+    const char* rekey_env = std::getenv("GAPBS_CXL_CRYPTO_REKEY");
+    const bool crypto_mode = !sec.uses_mgr();
+    const bool crypto_rekey = crypto_mode && use_public && (!rekey_env || !*rekey_env || *rekey_env != '0');
+
     auto get_key = [&](uint64_t off, uint64_t len, unsigned char out_key[crypto_stream_chacha20_ietf_KEYBYTES]) {
       if (sec.uses_mgr()) {
         sec.GetKeyForRangeOrExit(off, len, out_key);
         return;
       }
-      if (use_public) {
+      if (use_public && !crypto_rekey) {
         sec.GetCommonKeyOrExit(out_key);
       } else {
         sec.GetVmKeyOrExit(out_key);
@@ -276,24 +282,243 @@ class BuilderBase {
     };
 
     pvector<SGOffset> out_offsets(nn + 1);
-    std::memcpy(out_offsets.data(), mm + out_offsets_off, out_offsets_bytes);
+    uint64_t eff_out_offsets_off = out_offsets_off;
+    uint64_t eff_out_neigh_off = out_neigh_off;
+    uint64_t eff_in_offsets_off = in_offsets_off;
+    uint64_t eff_in_neigh_off = in_neigh_off;
+
+    if (crypto_rekey) {
+      // Cross-VM crypto mode: reader first "rekeys" the public (common-key) encrypted
+      // copy into its own private shared-memory region encrypted with its VM key.
+      // Computation then touches only the reader-private ciphertext and decrypts on demand.
+      struct CryptoPrivHeader {
+        uint64_t magic;
+        uint32_t version;
+        uint32_t state;
+        uint64_t sig;
+        uint64_t out_offsets_off;
+        uint64_t out_neigh_off;
+        uint64_t in_offsets_off;
+        uint64_t in_neigh_off;
+        uint64_t bytes_required;
+      };
+      static const uint64_t kPrivMagic = 0x5652505342504147ULL;  // "GAPBSPRV" (LE)
+      static const uint32_t kPrivVersion = 1;
+      static const uint32_t kPrivDone = 1u << 0;
+      static const uint32_t kPrivBusy = 1u << 1;
+
+      const uint64_t rekey_t0 = gapbs::cxl_shm::NowNs();
+      const uint64_t delay_ns = gapbs::cxl_shm::ShmDelayNsFromEnv();
+
+      unsigned char vm_key[crypto_stream_chacha20_ietf_KEYBYTES];
+      unsigned char common_key[crypto_stream_chacha20_ietf_KEYBYTES];
+      sec.GetVmKeyOrExit(vm_key);
+      sec.GetCommonKeyOrExit(common_key);
+
+      auto env_size_bytes = [&](const char* key, size_t def) -> size_t {
+        const char* v = std::getenv(key);
+        if (!v || !*v) return def;
+        size_t out = 0;
+        if (!gapbs::cxl_shm::ParseSizeBytes(std::string(v), &out)) return def;
+        return out;
+      };
+
+      size_t in_entries = 0;
+      size_t in_neigh_bytes = 0;
+      const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
+      if (has_inverse) {
+        SGOffset last = 0;
+        std::memcpy(&last, mm + in_offsets_off + nn * sizeof(SGOffset), sizeof(last));
+        gapbs::cxl_sec::CryptAtOffset(reinterpret_cast<unsigned char*>(&last), sizeof(last), kSecDirGraph, kRegionInOffsets,
+                                      0, nn * sizeof(SGOffset), common_key);
+        if (last < 0) {
+          std::cerr << "[gapbs] CXL crypto rekey: invalid inverse entries: " << last << std::endl;
+          std::exit(-141);
+        }
+        in_entries = static_cast<size_t>(last);
+        in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
+      }
+
+      size_t need = 4096;
+      need = gapbs::cxl_shm::AlignUp(need, 64);
+      const uint64_t dst_out_offsets_rel = static_cast<uint64_t>(need);
+      need += out_offsets_bytes;
+      need = gapbs::cxl_shm::AlignUp(need, 64);
+      const uint64_t dst_out_neigh_rel = static_cast<uint64_t>(need);
+      need += out_neigh_bytes;
+      uint64_t dst_in_offsets_rel = 0;
+      uint64_t dst_in_neigh_rel = 0;
+      if (has_inverse) {
+        need = gapbs::cxl_shm::AlignUp(need, 64);
+        dst_in_offsets_rel = static_cast<uint64_t>(need);
+        need += in_offsets_bytes;
+        need = gapbs::cxl_shm::AlignUp(need, 64);
+        dst_in_neigh_rel = static_cast<uint64_t>(need);
+        need += in_neigh_bytes;
+      }
+      const size_t bytes_required = gapbs::cxl_shm::AlignUp(need, 4096);
+
+      const size_t def_priv_base = gapbs::cxl_shm::AlignUp(static_cast<size_t>(h.total_bytes), 4096);
+      const size_t priv_base = env_size_bytes(
+          "GAPBS_CXL_CRYPTO_PRIV_REGION_BASE",
+          env_size_bytes("CXL_CRYPTO_PRIV_REGION_BASE", def_priv_base));
+      const size_t priv_size = env_size_bytes(
+          "GAPBS_CXL_CRYPTO_PRIV_REGION_SIZE",
+          env_size_bytes("CXL_CRYPTO_PRIV_REGION_SIZE", bytes_required));
+
+      if ((priv_base % 4096) != 0 || (priv_size % 4096) != 0) {
+        std::cerr << "[gapbs] CXL crypto rekey: priv region base/size must be 4K-aligned: base=" << priv_base
+                  << " size=" << priv_size << std::endl;
+        std::exit(-142);
+      }
+      if (priv_size < bytes_required) {
+        std::cerr << "[gapbs] CXL crypto rekey: priv region too small: need=" << bytes_required
+                  << " size=" << priv_size << std::endl;
+        std::exit(-143);
+      }
+      const uint64_t node_idx = static_cast<uint64_t>(local_id - 1);
+      const uint64_t priv_off64 = static_cast<uint64_t>(priv_base) + node_idx * static_cast<uint64_t>(priv_size);
+      if (priv_off64 > static_cast<uint64_t>(shm.size()) ||
+          static_cast<uint64_t>(priv_size) > static_cast<uint64_t>(shm.size()) - priv_off64) {
+        std::cerr << "[gapbs] CXL crypto rekey: priv region out of range: map_size=" << shm.size()
+                  << " base=" << priv_base << " node_id=" << local_id << " per_node=" << priv_size << std::endl;
+        std::exit(-144);
+      }
+
+      unsigned char* base_mut = reinterpret_cast<unsigned char*>(shm.base());
+      CryptoPrivHeader* ph = reinterpret_cast<CryptoPrivHeader*>(base_mut + static_cast<size_t>(priv_off64));
+
+      auto sig_hash = [&]() -> uint64_t {
+        uint64_t s = 1469598103934665603ULL;
+        auto mix = [&](uint64_t x) {
+          s ^= x;
+          s *= 1099511628211ULL;
+        };
+        auto mix_bytes = [&](const unsigned char* p, size_t len) {
+          if (!p || len == 0) return;
+          for (size_t i = 0; i < len; i++) {
+            s ^= static_cast<uint64_t>(p[i]);
+            s *= 1099511628211ULL;
+          }
+        };
+        mix(kPrivMagic);
+        mix(h.magic);
+        mix(h.version);
+        mix(h.flags);
+        mix(h.num_nodes);
+        mix(h.num_edges_directed);
+        mix(h.dest_bytes);
+        mix(h.owner_id);
+        mix(h.total_bytes);
+        mix(out_offsets_off);
+        mix(out_neigh_off);
+        mix(in_offsets_off);
+        mix(in_neigh_off);
+        mix(out_offsets_bytes);
+        mix(out_neigh_bytes);
+        mix(in_offsets_bytes);
+        mix(in_neigh_bytes);
+        mix(priv_base);
+        mix(priv_size);
+        // Include key material in the signature to avoid reusing a stale private
+        // copy across runs when CXL_SEC_KEY_HEX / CXL_SEC_COMMON_KEY_HEX change.
+        mix_bytes(vm_key, crypto_stream_chacha20_ietf_KEYBYTES);
+        mix_bytes(common_key, crypto_stream_chacha20_ietf_KEYBYTES);
+        return s;
+      };
+      const uint64_t sig = sig_hash();
+
+      const unsigned timeout_ms = EnvU32Local("GAPBS_CXL_CRYPTO_REKEY_TIMEOUT_MS", 600000);
+      unsigned waited_ms = 0;
+      while (true) {
+        uint32_t st = __atomic_load_n(&ph->state, __ATOMIC_ACQUIRE);
+        if ((st & kPrivDone) && !(st & kPrivBusy) &&
+            ph->magic == kPrivMagic && ph->version == kPrivVersion && ph->sig == sig) {
+          break;
+        }
+        if (!(st & kPrivBusy)) {
+          uint32_t desired = (st | kPrivBusy) & ~kPrivDone;
+          if (!__atomic_compare_exchange_n(&ph->state, &st, desired, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            continue;
+          }
+
+          // We own the rekey slot for this node's private copy.
+          ph->magic = kPrivMagic;
+          ph->version = kPrivVersion;
+          ph->sig = sig;
+          ph->bytes_required = bytes_required;
+
+          ph->out_offsets_off = static_cast<uint64_t>(priv_off64) + dst_out_offsets_rel;
+          ph->out_neigh_off = static_cast<uint64_t>(priv_off64) + dst_out_neigh_rel;
+          ph->in_offsets_off = has_inverse ? (static_cast<uint64_t>(priv_off64) + dst_in_offsets_rel) : 0;
+          ph->in_neigh_off = has_inverse ? (static_cast<uint64_t>(priv_off64) + dst_in_neigh_rel) : 0;
+
+          __sync_synchronize();
+
+          const size_t kChunk = 1 << 20;  // 1 MiB
+          std::unique_ptr<unsigned char[]> tmp(new unsigned char[kChunk]);
+          auto rekey_copy = [&](uint64_t src_off, uint64_t dst_off, size_t bytes, uint8_t region_id) {
+            size_t off = 0;
+            while (off < bytes) {
+              const size_t nbytes = std::min(kChunk, bytes - off);
+              const unsigned char* src = mm + src_off + off;
+              unsigned char* dst = base_mut + dst_off + off;
+              if (delay_ns && gapbs::cxl_shm::PtrInCxlShm(src)) gapbs::cxl_shm::ShmDelayForNs(delay_ns);
+              std::memcpy(tmp.get(), src, nbytes);
+              gapbs::cxl_sec::CryptAtOffset(tmp.get(), nbytes, kSecDirGraph, region_id, 0, off, common_key);
+              gapbs::cxl_sec::CryptAtOffset(tmp.get(), nbytes, kSecDirGraph, region_id, 0, off, vm_key);
+              if (delay_ns && gapbs::cxl_shm::PtrInCxlShm(dst)) gapbs::cxl_shm::ShmDelayForNs(delay_ns);
+              std::memcpy(dst, tmp.get(), nbytes);
+              off += nbytes;
+            }
+          };
+
+          rekey_copy(out_offsets_off, ph->out_offsets_off, out_offsets_bytes, kRegionOutOffsets);
+          rekey_copy(out_neigh_off, ph->out_neigh_off, out_neigh_bytes, kRegionOutNeigh);
+          if (has_inverse) {
+            rekey_copy(in_offsets_off, ph->in_offsets_off, in_offsets_bytes, kRegionInOffsets);
+            rekey_copy(in_neigh_off, ph->in_neigh_off, in_neigh_bytes, kRegionInNeigh);
+          }
+
+          __sync_synchronize();
+          __atomic_store_n(&ph->state, kPrivDone, __ATOMIC_RELEASE);
+          break;
+        }
+
+        if (waited_ms >= timeout_ms) {
+          std::cerr << "[gapbs] CXL crypto rekey: timeout waiting for private copy (state=" << st
+                    << ", timeout_ms=" << timeout_ms << ")" << std::endl;
+          std::exit(-145);
+        }
+        usleep(1000);
+        waited_ms++;
+      }
+
+      eff_out_offsets_off = ph->out_offsets_off;
+      eff_out_neigh_off = ph->out_neigh_off;
+      eff_in_offsets_off = ph->in_offsets_off;
+      eff_in_neigh_off = ph->in_neigh_off;
+
+      rekey_ms = (gapbs::cxl_shm::NowNs() - rekey_t0) / 1000000ULL;
+    }
+
+    std::memcpy(out_offsets.data(), mm + eff_out_offsets_off, out_offsets_bytes);
     unsigned char key_out_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
-    get_key(out_offsets_off, out_offsets_bytes, key_out_offsets);
+    get_key(eff_out_offsets_off, out_offsets_bytes, key_out_offsets);
     gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_offsets.data()), out_offsets_bytes, kSecDirGraph,
                           kRegionOutOffsets, 0, key_out_offsets);
 
     unsigned char* base = reinterpret_cast<unsigned char*>(shm.base());
-    DestID_* out_neigh_cipher = reinterpret_cast<DestID_*>(base + out_neigh_off);
+    DestID_* out_neigh_cipher = reinterpret_cast<DestID_*>(base + eff_out_neigh_off);
 
     // Crypto mode (pre-shared key, no security manager): keep shared memory
     // encrypted and decrypt into TD-private memory. This avoids in-place
     // decryption that would otherwise materialize plaintext in the shared region.
-    const bool crypto_mode = !sec.uses_mgr();
     const char* lazy_env = std::getenv("GAPBS_CXL_CRYPTO_LAZY");
     const bool crypto_lazy = crypto_mode && (!lazy_env || !*lazy_env || *lazy_env != '0');
     if (crypto_mode && crypto_lazy) {
       unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
-      get_key(out_neigh_off, out_neigh_bytes, key_out_neigh);
+      get_key(eff_out_neigh_off, out_neigh_bytes, key_out_neigh);
 
       DestID_* out_neigh = out_neigh_cipher;  // ciphertext in shared memory
       DestID_** out_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(out_offsets, out_neigh);
@@ -310,18 +535,18 @@ class BuilderBase {
         const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
         pvector<SGOffset> in_offsets(nn + 1);
         const uint64_t dec2_t0 = gapbs::cxl_shm::NowNs();
-        std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
+        std::memcpy(in_offsets.data(), mm + eff_in_offsets_off, in_offsets_bytes);
         unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
-        get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
+        get_key(eff_in_offsets_off, in_offsets_bytes, key_in_offsets);
         gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
                               kRegionInOffsets, 0, key_in_offsets);
         decrypt_ms += (gapbs::cxl_shm::NowNs() - dec2_t0) / 1000000ULL;
 
         const size_t in_entries = static_cast<size_t>(in_offsets[n]);
         const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
-        DestID_* in_neigh = reinterpret_cast<DestID_*>(base + in_neigh_off);  // ciphertext in shared memory
+        DestID_* in_neigh = reinterpret_cast<DestID_*>(base + eff_in_neigh_off);  // ciphertext in shared memory
         unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
-        get_key(in_neigh_off, in_neigh_bytes, key_in_neigh);
+        get_key(eff_in_neigh_off, in_neigh_bytes, key_in_neigh);
 
         DestID_** in_index = CSRGraph<NodeID_, DestID_, invert>::GenIndex(in_offsets, in_neigh);
         CSRGraph<NodeID_, DestID_, invert> g(n, out_index, out_neigh, in_index, in_neigh);
@@ -349,7 +574,7 @@ class BuilderBase {
       DestID_* out_neigh = new DestID_[out_entries];
       copy_from_shm_with_delay(out_neigh, out_neigh_cipher, out_neigh_bytes);
       unsigned char key_out_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
-      get_key(out_neigh_off, out_neigh_bytes, key_out_neigh);
+      get_key(eff_out_neigh_off, out_neigh_bytes, key_out_neigh);
       gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(out_neigh), out_neigh_bytes, kSecDirGraph, kRegionOutNeigh,
                             0, key_out_neigh);
 
@@ -363,19 +588,19 @@ class BuilderBase {
       if (has_inverse) {
         const size_t in_offsets_bytes = (nn + 1) * sizeof(SGOffset);
         pvector<SGOffset> in_offsets(nn + 1);
-        std::memcpy(in_offsets.data(), mm + in_offsets_off, in_offsets_bytes);
+        std::memcpy(in_offsets.data(), mm + eff_in_offsets_off, in_offsets_bytes);
         unsigned char key_in_offsets[crypto_stream_chacha20_ietf_KEYBYTES];
-        get_key(in_offsets_off, in_offsets_bytes, key_in_offsets);
+        get_key(eff_in_offsets_off, in_offsets_bytes, key_in_offsets);
         gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_offsets.data()), in_offsets_bytes, kSecDirGraph,
                               kRegionInOffsets, 0, key_in_offsets);
 
         const size_t in_entries = static_cast<size_t>(in_offsets[n]);
         const size_t in_neigh_bytes = in_entries * static_cast<size_t>(h.dest_bytes);
-        DestID_* in_neigh_cipher = reinterpret_cast<DestID_*>(base + in_neigh_off);
+        DestID_* in_neigh_cipher = reinterpret_cast<DestID_*>(base + eff_in_neigh_off);
         DestID_* in_neigh = new DestID_[in_entries];
         copy_from_shm_with_delay(in_neigh, in_neigh_cipher, in_neigh_bytes);
         unsigned char key_in_neigh[crypto_stream_chacha20_ietf_KEYBYTES];
-        get_key(in_neigh_off, in_neigh_bytes, key_in_neigh);
+        get_key(eff_in_neigh_off, in_neigh_bytes, key_in_neigh);
         gapbs::cxl_sec::Crypt(reinterpret_cast<unsigned char*>(in_neigh), in_neigh_bytes, kSecDirGraph, kRegionInNeigh,
                               0, key_in_neigh);
 
