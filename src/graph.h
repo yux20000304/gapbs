@@ -10,6 +10,7 @@
 #include <iostream>
 #include <type_traits>
 
+#include "cxl_allocator.h"
 #include "pvector.h"
 #include "util.h"
 
@@ -118,14 +119,14 @@ class CSRGraph {
 
   void ReleaseResources() {
     if (out_index_ != nullptr)
-      delete[] out_index_;
+      gapbs::cxl::FreeArray(out_index_);
     if (out_neighbors_ != nullptr)
-      delete[] out_neighbors_;
+      gapbs::cxl::FreeArray(out_neighbors_);
     if (directed_) {
       if (in_index_ != nullptr)
-        delete[] in_index_;
+        gapbs::cxl::FreeArray(in_index_);
       if (in_neighbors_ != nullptr)
-        delete[] in_neighbors_;
+        gapbs::cxl::FreeArray(in_neighbors_);
     }
   }
 
@@ -241,7 +242,7 @@ class CSRGraph {
 
   static DestID_** GenIndex(const pvector<SGOffset> &offsets, DestID_* neighs) {
     NodeID_ length = offsets.size();
-    DestID_** index = new DestID_*[length];
+    DestID_** index = gapbs::cxl::AllocArray<DestID_*>(length);
     #pragma omp parallel for
     for (NodeID_ n=0; n < length; n++)
       index[n] = neighs + offsets[n];
