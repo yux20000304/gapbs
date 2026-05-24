@@ -48,15 +48,18 @@ inline bool IsTruthy(const char *value) {
 }
 
 inline bool GraphAllocatorRequested() {
-  return IsTruthy(std::getenv("GAPBS_CXL_GRAPH"));
+  return IsTruthy(std::getenv("GAPBS_CXL_GRAPH")) ||
+         IsTruthy(std::getenv("GAPBS_DSMTEE_GRAPH"));
 }
 
 inline bool StrictMode() {
-  return IsTruthy(std::getenv("GAPBS_CXL_STRICT"));
+  return IsTruthy(std::getenv("GAPBS_CXL_STRICT")) ||
+         IsTruthy(std::getenv("GAPBS_DSMTEE_STRICT"));
 }
 
 inline bool VerboseMode() {
-  return IsTruthy(std::getenv("GAPBS_CXL_VERBOSE"));
+  return IsTruthy(std::getenv("GAPBS_CXL_VERBOSE")) ||
+         IsTruthy(std::getenv("GAPBS_DSMTEE_VERBOSE"));
 }
 
 inline size_t ParseSize(const char *value, size_t default_value) {
@@ -164,12 +167,21 @@ class Allocator {
 
   void Init() {
     const char *path_env = std::getenv("GAPBS_CXL_PATH");
-    std::string path = path_env == nullptr ? "/dev/gem5_cxl_mem" : path_env;
+    if (path_env == nullptr)
+      path_env = std::getenv("GAPBS_DSMTEE_PATH");
+    std::string path = path_env == nullptr ?
+                       (IsTruthy(std::getenv("GAPBS_DSMTEE_GRAPH")) ?
+                        "/dev/gem5_dsm_tee" : "/dev/gem5_cxl_mem") :
+                       path_env;
 
     const size_t default_size = 1ULL << 30;
     const char *size_env = std::getenv("GAPBS_CXL_SIZE");
     if (size_env == nullptr)
       size_env = std::getenv("GAPBS_CXL_MAP_SIZE");
+    if (size_env == nullptr)
+      size_env = std::getenv("GAPBS_DSMTEE_SIZE");
+    if (size_env == nullptr)
+      size_env = std::getenv("GAPBS_DSMTEE_MAP_SIZE");
     size_ = ParseSize(size_env, default_size);
 
     fd_ = open(path.c_str(), O_RDWR);
