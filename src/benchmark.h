@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "builder.h"
+#include "gem5_roi.h"
 #include "graph.h"
 #include "timer.h"
 #include "util.h"
@@ -104,9 +105,11 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
   double total_seconds = 0;
   Timer trial_timer;
   for (int iter=0; iter < cli.num_trials(); iter++) {
+    gapbs_gem5_roi::WorkBegin(iter, 0);
     trial_timer.Start();
     auto result = kernel(g);
     trial_timer.Stop();
+    gapbs_gem5_roi::WorkEnd(iter, 0);
     PrintTime("Trial Time", trial_timer.Seconds());
     total_seconds += trial_timer.Seconds();
     if (cli.do_analysis() && (iter == (cli.num_trials()-1)))
